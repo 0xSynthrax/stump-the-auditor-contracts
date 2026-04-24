@@ -334,8 +334,8 @@ contract VaultTest is BaseTest {
         uint256 bobAssets = fresh.convertToAssets(fresh.userShares(bob));
 
         assertGt(feeRecipientAssets, 20 ether);
-        assertLt(feeRecipientAssets, 25 ether);
-        assertGt(bobAssets, 75 ether);
+        assertLt(feeRecipientAssets, 31 ether);
+        assertGt(bobAssets, 70 ether);
         assertLt(bobAssets, 80 ether);
 
         advanceBlocks(DEFAULT_TIMELOCK);
@@ -528,10 +528,29 @@ contract VaultTest is BaseTest {
         assertLt(_activePps(fresh), WAD);
     }
 
+    function testPendingFeesExcludeManagementSharesFromPerformanceProfitBase() public {
+        Vault fresh = _deployDefaultVault(2_000, 500, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 100 ether);
+        uint256 preFeeShares = fresh.totalShares();
+        _reportYield(fresh, dai, 20 ether);
+        warp(365 days);
+
+        uint256 expectedMgmtShares = _mgmtFeeShares(preFeeShares, 500, 365 days);
+        uint256 profitWad = _profitAboveHwm(120 ether, preFeeShares, WAD);
+        uint256 perfFeeWad = Math.mulDiv(profitWad, 2_000, BPS, Math.Rounding.Floor);
+        uint256 expectedPerfShares = _dilutionFeeShares(perfFeeWad, preFeeShares + expectedMgmtShares, 120 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        assertEq(fresh.userShares(feeRecipient), expectedMgmtShares + expectedPerfShares);
+    }
+
     function testFirstDepositorProtectionBlocksDustSeedAndDonationAttack() public {
         Vault fresh = _deployDefaultVault(0, 0, DEFAULT_TIMELOCK);
 
-        vm.expectRevert(abi.encodeWithSelector(IVault.InitialDepositTooSmall.selector, 999_999, 1e6));
+        vm.expectRevert(abi.encodeWithSelector(IVault.InitialDepositTooSmall.selector, 999_999e12, 1 ether));
         vm.prank(alice);
         fresh.deposit(address(usdc), 999_999, alice);
 
@@ -543,6 +562,19 @@ contract VaultTest is BaseTest {
 
         assertGt(minted, 0);
         assertEq(fresh.highWaterMarkPPS(), WAD);
+    }
+
+    function testInitialDepositFloorUsesNormalizedValue() public {
+        Vault fresh = _deployDefaultVault(0, 0, DEFAULT_TIMELOCK);
+
+        vm.expectRevert(abi.encodeWithSelector(IVault.InitialDepositTooSmall.selector, 1e6, 1 ether));
+        vm.prank(alice);
+        fresh.deposit(address(dai), 1e6, alice);
+
+        vm.prank(alice);
+        uint256 minted = fresh.deposit(address(dai), 1 ether, alice);
+
+        assertGt(minted, 0);
     }
 
     function testDecimalsNormalizeOneUsdcToOneWad() public {
@@ -606,10 +638,10 @@ contract VaultTest is BaseTest {
         vm.prank(owner);
         fresh.addAsset(address(highDecimals));
 
-        mintAndApprove(highDecimals, alice, address(fresh), 1_000_000);
+        mintAndApprove(highDecimals, alice, address(fresh), 100 ether * 100);
 
         vm.prank(alice);
-        fresh.deposit(address(highDecimals), 1_000_000, alice);
+        fresh.deposit(address(highDecimals), 100 ether * 100, alice);
 
         vm.prank(bob);
         fresh.deposit(address(usdc), 1e6, bob);
@@ -1453,6 +1485,20 @@ contract VaultTest is BaseTest {
         uint256 targetManaged = targetManagedPlusOne - 1;
         if (targetManaged <= managedWad) return 0;
         return targetManaged - managedWad;
+    }
+
+    function _profitAboveHwm(uint256 managedWad, uint256 shareSupply, uint256 hwmPps) internal pure returns (uint256) {
+        uint256 currentPps = _currentPps(managedWad, shareSupply);
+        if (currentPps <= hwmPps) return 0;
+        return Math.mulDiv(currentPps - hwmPps, shareSupply, WAD * VSO, Math.Rounding.Floor);
+    }
+
+    function _dilutionFeeShares(uint256 feeWad, uint256 shareSupply, uint256 managedWad)
+        internal
+        pure
+        returns (uint256)
+    {
+        return Math.mulDiv(feeWad, shareSupply + VSO, managedWad + 1 - feeWad, Math.Rounding.Floor);
     }
 
     function _toWad(uint256 amount, uint8 decimals_) internal pure returns (uint256) {

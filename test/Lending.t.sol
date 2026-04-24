@@ -274,6 +274,27 @@ contract LendingTest is BaseTest {
         assertEq(supplyBalance, 0);
     }
 
+    function testWithdrawAllowsHealthyAccountAboveBorrowCapacity() public {
+        vm.prank(owner);
+        lending.setCollateralEnabled(address(wbtc), false);
+
+        _supply(alice, usdc, 5_000e6, alice);
+        _supply(bob, weth, 1 ether, bob);
+        _borrow(bob, usdc, 1_100e6, bob);
+        _supply(bob, wbtc, 1e8, bob);
+
+        vm.prank(owner);
+        oracle.setPrice(address(weth), 1_400e8);
+
+        (,,, uint256 healthFactor) = lending.getUserAccountData(bob);
+        assertGt(healthFactor, lending.MIN_HEALTH_FACTOR());
+
+        vm.prank(bob);
+        uint256 withdrawn = lending.withdraw(address(wbtc), 1e8, bob);
+
+        assertEq(withdrawn, 1e8);
+    }
+
     function testPartialLiquidationAtFullCloseFactorLeavesBorrowerHealthy() public {
         vm.prank(owner);
         lending.setCloseFactor(10_000);
@@ -296,7 +317,7 @@ contract LendingTest is BaseTest {
         assertEq(healthFactorAfter, type(uint256).max);
     }
 
-    function testLiquidationClampsWhenCollateralIsLessThanSeizeAmount() public {
+    function testLiquidationRevertsWhenCollateralIsLessThanSeizeAmount() public {
         vm.prank(owner);
         lending.setCloseFactor(10_000);
 
@@ -309,12 +330,14 @@ contract LendingTest is BaseTest {
 
         (uint256 bobCollateralBefore,) = lending.getUserReserveData(bob, address(weth));
 
+        vm.expectRevert(
+            abi.encodeWithSelector(ILendingPool.InsufficientSupply.selector, address(weth), 1.47 ether, 1 ether)
+        );
         vm.prank(charlie);
-        (, uint256 collateralSeized) = lending.liquidate(bob, address(weth), address(usdc), 1_400e6);
+        lending.liquidate(bob, address(weth), address(usdc), 1_400e6);
 
-        assertEq(collateralSeized, bobCollateralBefore);
         (uint256 bobCollateralAfter,) = lending.getUserReserveData(bob, address(weth));
-        assertEq(bobCollateralAfter, 0);
+        assertEq(bobCollateralAfter, bobCollateralBefore);
     }
 
     function testFragmentedLiquidationDoesNotCompoundCollateralRounding() public {
@@ -379,6 +402,28 @@ contract LendingTest is BaseTest {
         lending.liquidate(bob, address(usdc), address(weth), 1);
     }
 
+    function testDustDebtCanLiquidateWhenCloseFactorWouldRoundToZeroScaledDebt() public {
+        _supply(alice, weth, 1, alice);
+        _supply(bob, usdc, 1, bob);
+        _borrow(bob, weth, 1, bob);
+
+        advanceSeconds(365 days);
+        lending.accrueInterest(address(weth));
+
+        vm.prank(owner);
+        oracle.setPrice(address(weth), 9_000e8);
+        vm.prank(owner);
+        oracle.setPrice(address(usdc), 1);
+
+        vm.prank(charlie);
+        (uint256 repaid, uint256 seized) = lending.liquidate(bob, address(usdc), address(weth), 2);
+
+        assertEq(repaid, 2);
+        assertEq(seized, 1);
+        (, uint256 remainingDebt) = lending.getUserReserveData(bob, address(weth));
+        assertEq(remainingDebt, 0);
+    }
+
     function testInterestMathOverOneYearAtHalfUtilizationWithinTolerance() public {
         _supply(alice, usdc, 2_000e6, alice);
         _supply(bob, weth, 2 ether, bob);
@@ -441,6 +486,20 @@ contract LendingTest is BaseTest {
         assertEq(collateralAssets[0], address(usdc));
     }
 
+    function testSupplyOnBehalfRegistersCollateralForBeneficiary() public {
+        _supply(alice, usdc, 1_000e6, alice);
+
+        vm.prank(alice);
+        lending.supply(address(weth), 1 ether, bob);
+
+        (uint256 collateralValue,, uint256 availableBorrows,) = lending.getUserAccountData(bob);
+        assertEq(collateralValue, 2_000e18);
+        assertGt(availableBorrows, 0);
+
+        vm.prank(bob);
+        lending.borrow(address(usdc), 500e6, bob);
+    }
+
     function testFullRepayWithMaxRemovesBorrowAsset() public {
         _supply(alice, usdc, 1_000e6, alice);
         _supply(bob, weth, 1 ether, bob);
@@ -468,6 +527,35 @@ contract LendingTest is BaseTest {
 
         assertEq(withdrawn, aliceSupplyBalance);
         assertApproxEqAbs(usdc.balanceOf(address(lending)), reserve.accruedReserves, 2);
+    }
+
+    function testUnrealizedReservesDoNotLockFreshSupplierDeposit() public {
+        ILendingPool.InterestRateParams memory aggressiveParams = ILendingPool.InterestRateParams({
+            baseRateRayPerYear: 0, slope1RayPerYear: 1e27, slope2RayPerYear: 5e27, optimalUtilizationBps: 8_000
+        });
+
+        vm.prank(owner);
+        lending.setInterestRateParams(address(usdc), aggressiveParams);
+        vm.prank(owner);
+        lending.setReserveParams(address(usdc), 8_000, 8_500, 500, 5_000);
+
+        _supply(alice, usdc, 1_000e6, alice);
+        _supply(bob, weth, 2 ether, bob);
+        _borrow(bob, usdc, 1_000e6, bob);
+
+        advanceSeconds(5 * 365 days);
+        lending.accrueInterest(address(usdc));
+
+        ILendingPool.Reserve memory reserve = lending.getReserveData(address(usdc));
+        assertGt(reserve.accruedReserves, usdc.balanceOf(address(lending)));
+
+        _supply(charlie, usdc, 1e6, charlie);
+
+        (uint256 charlieSupply,) = lending.getUserReserveData(charlie, address(usdc));
+        vm.prank(charlie);
+        uint256 withdrawn = lending.withdraw(address(usdc), charlieSupply, charlie);
+
+        assertEq(withdrawn, charlieSupply);
     }
 
     function testSupplyOneUnitProducesNonZeroScaledBalance() public {
@@ -520,7 +608,8 @@ contract LendingTest is BaseTest {
             lastBorrowIndex = reserve.borrowIndex;
         }
 
-        assertGt(lending.utilizationRateRay(address(usdc)), lending.RAY());
+        assertEq(lending.utilizationRateRay(address(usdc)), lending.RAY());
+        assertLe(lending.currentBorrowRateRay(address(usdc)) * lending.SECONDS_PER_YEAR(), 6e27);
         assertGt(reserve.accruedReserves, 0);
     }
 
@@ -703,6 +792,23 @@ contract LendingTest is BaseTest {
         (uint256 bobCollateralAfter,) = lending.getUserReserveData(bob, address(weth));
         assertLt(bobDebtAfter, 1_000e6);
         assertLt(bobCollateralAfter, 1 ether);
+    }
+
+    function testLiquidationCannotSeizeSupplyNeverEnabledAsCollateral() public {
+        vm.prank(owner);
+        lending.setCollateralEnabled(address(wbtc), false);
+
+        _supply(alice, usdc, 2_000e6, alice);
+        _supply(bob, weth, 1 ether, bob);
+        _supply(bob, wbtc, 1e8, bob);
+        _borrow(bob, usdc, 1_000e6, bob);
+
+        vm.prank(owner);
+        oracle.setPrice(address(weth), 1_000e8);
+
+        vm.expectRevert(abi.encodeWithSelector(ILendingPool.InsufficientSupply.selector, address(wbtc), 500e6, 0));
+        vm.prank(charlie);
+        lending.liquidate(bob, address(wbtc), address(usdc), 500e6);
     }
 
     function testRevertZeroAmount() public {

@@ -44,6 +44,7 @@ library LendingMath {
             uint256 utilizationRay = totalSupplyActual == 0
                 ? RAY
                 : totalBorrowActual == 0 ? 0 : Math.mulDiv(totalBorrowActual, RAY, totalSupplyActual);
+            if (utilizationRay > RAY) utilizationRay = RAY;
             (uint256 borrowRatePerYear, uint256 supplyRatePerYear) = ratesRay(updated, utilizationRay);
 
             newBorrowIndex = Math.mulDiv(oldBorrowIndex, RAY + ((borrowRatePerYear / SECONDS_PER_YEAR) * dt), RAY);
@@ -103,6 +104,7 @@ library LendingMath {
         if (totalBorrowActual == 0) return 0;
 
         utilizationRay = Math.mulDiv(totalBorrowActual, RAY, totalSupplyActual);
+        if (utilizationRay > RAY) utilizationRay = RAY;
     }
 
     function assetValueWad(uint256 amount, uint8 decimals, uint256 price) internal pure returns (uint256 valueWad) {

@@ -45,7 +45,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
     uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3_000;
     uint256 public constant MAX_TIMELOCK_BLOCKS = 7 days / 12;
-    uint256 public constant MIN_INITIAL_DEPOSIT = 1e6;
+    uint256 public constant MIN_INITIAL_DEPOSIT = 1e18;
     uint256 public constant VIRTUAL_SHARES_OFFSET = 1e3;
     uint256 public constant SECONDS_PER_YEAR = 365 days;
 
@@ -124,9 +124,6 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         _setOrCheckShareAsset(receiver, asset);
 
         bool initializingSupply = totalShares == 0;
-        if (initializingSupply && amount < MIN_INITIAL_DEPOSIT) {
-            revert InitialDepositTooSmall(amount, MIN_INITIAL_DEPOSIT);
-        }
 
         IERC20 assetToken = IERC20(asset);
         uint256 balanceBefore = assetToken.balanceOf(address(this));
@@ -137,6 +134,9 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
         uint256 amountWad = _toWad(received, config.decimals);
         if (amountWad == 0) revert ZeroAmount();
+        if (initializingSupply && amountWad < MIN_INITIAL_DEPOSIT) {
+            revert InitialDepositTooSmall(amountWad, MIN_INITIAL_DEPOSIT);
+        }
 
         uint256 activeManagedWad = _activeManagedWad();
         sharesMinted = _computeShares(amountWad, totalShares, activeManagedWad);
@@ -522,17 +522,17 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         if (effectiveTotalShares == 0) return (activeManagedWad, effectiveTotalShares, 0, 0, newHighWaterMarkPPS);
 
         uint256 dt = block.timestamp - lastFeeAccrual;
+        uint256 profitShareSupply = effectiveTotalShares;
         if (dt != 0 && managementFeeBps != 0) {
             mgmtFeeShares =
                 Math.mulDiv(effectiveTotalShares, managementFeeBps * dt, BPS * SECONDS_PER_YEAR, Math.Rounding.Floor);
             effectiveTotalShares += mgmtFeeShares;
         }
 
-        (, uint256 profitWad) =
-            _profitAboveHighWaterMarkWad(activeManagedWad, effectiveTotalShares, newHighWaterMarkPPS);
+        (, uint256 profitWad) = _profitAboveHighWaterMarkWad(activeManagedWad, profitShareSupply, newHighWaterMarkPPS);
         if (profitWad != 0) {
             uint256 perfFeeWad = Math.mulDiv(profitWad, performanceFeeBps, BPS, Math.Rounding.Floor);
-            perfFeeShares = _computeShares(perfFeeWad, effectiveTotalShares, activeManagedWad);
+            perfFeeShares = _computeFeeShares(perfFeeWad, effectiveTotalShares, activeManagedWad);
             effectiveTotalShares += perfFeeShares;
             newHighWaterMarkPPS = _currentPPS(activeManagedWad, effectiveTotalShares);
         }
@@ -598,6 +598,14 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         returns (uint256 shares)
     {
         return Math.mulDiv(amountWad, shareSupply + VIRTUAL_SHARES_OFFSET, managedWad + 1, Math.Rounding.Floor);
+    }
+
+    function _computeFeeShares(uint256 feeWad, uint256 shareSupply, uint256 managedWad)
+        internal
+        pure
+        returns (uint256 shares)
+    {
+        return Math.mulDiv(feeWad, shareSupply + VIRTUAL_SHARES_OFFSET, managedWad + 1 - feeWad, Math.Rounding.Floor);
     }
 
     /// @notice Computes WAD-denominated assets for a share amount under the virtual-offset share model.

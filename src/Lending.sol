@@ -118,7 +118,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         userScaledSupply[onBehalfOf][asset] += scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) + scaledAmount).toUint128();
 
-        if (onBehalfOf == msg.sender && reserve.useAsCollateral && !_hasCollateral[onBehalfOf][asset]) {
+        if (reserve.useAsCollateral && !_hasCollateral[onBehalfOf][asset]) {
             _hasCollateral[onBehalfOf][asset] = true;
             userCollateralAssets[onBehalfOf].push(asset);
         }
@@ -159,7 +159,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         if (_userHasDebt(msg.sender)) {
             (,,, uint256 healthFactor) = _getUserAccountData(msg.sender);
             if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorBelowThreshold(healthFactor);
-            _requireWithinBorrowCapacity(msg.sender);
         }
 
         uint256 liquidity = _availableLiquidity(asset, reserve.accruedReserves);
@@ -630,7 +629,9 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
         uint256 borrowerDebt =
             LendingMath.scaledToUnderlying(borrowerScaledDebt, debtReserve.borrowIndex, Math.Rounding.Ceil);
-        uint256 maxCloseAmount = Math.mulDiv(borrowerDebt, closeFactorBps, BPS);
+        uint256 maxCloseScaled = Math.mulDiv(borrowerScaledDebt, closeFactorBps, BPS, Math.Rounding.Ceil);
+        uint256 maxCloseAmount =
+            LendingMath.scaledToUnderlying(maxCloseScaled, debtReserve.borrowIndex, Math.Rounding.Ceil);
         if (debtToCover > maxCloseAmount) {
             revert LiquidationAmountExceedsCloseFactor(debtToCover, maxCloseAmount);
         }
@@ -678,11 +679,14 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         }
 
         uint256 borrowerScaledCollateral = userScaledSupply[borrower][collateralAsset];
+        if (!_hasCollateral[borrower][collateralAsset]) {
+            revert InsufficientSupply(collateralAsset, debtToCover, 0);
+        }
         uint256 borrowerCollateral = LendingMath.scaledToUnderlying(
             borrowerScaledCollateral, collateralReserve.supplyIndex, Math.Rounding.Floor
         );
         if (targetCollateralAmount > borrowerCollateral) {
-            targetCollateralAmount = borrowerCollateral;
+            revert InsufficientSupply(collateralAsset, targetCollateralAmount, borrowerCollateral);
         }
 
         // rounding: liquidation floors both value and scaled-balance conversions so fragmentation cannot over-seize.
@@ -764,8 +768,8 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function _availableLiquidity(address asset, uint256 accruedReserves) internal view returns (uint256 liquidity) {
-        uint256 balance = IERC20(asset).balanceOf(address(this));
-        liquidity = balance > accruedReserves ? balance - accruedReserves : 0;
+        accruedReserves;
+        liquidity = IERC20(asset).balanceOf(address(this));
     }
 
     function _validateReserveParams(
