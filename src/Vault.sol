@@ -483,8 +483,8 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     function _accrueFees(address) internal {
         uint256 currentTime = block.timestamp;
         if (totalShares == 0) {
+            lastFeeAccrual = currentTime;
             if (totalPendingWithdrawWad == 0 && totalManagedWad == 0) {
-                lastFeeAccrual = currentTime;
                 highWaterMarkPPS = 0;
             }
             return;

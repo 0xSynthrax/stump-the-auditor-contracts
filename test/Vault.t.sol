@@ -549,6 +549,58 @@ contract VaultTest is BaseTest {
         assertGt(fresh.userShares(feeRecipient), feeSharesBefore);
     }
 
+    function testAllPendingAccrualAdvancesFeeClockWithoutResettingHighWaterMark() public {
+        Vault fresh = _deployDefaultVault(2_000, 100, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 100 ether);
+        _reportYield(fresh, dai, 20 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        uint256 hwmBefore = fresh.highWaterMarkPPS();
+        uint256 previousAccrual = fresh.lastFeeAccrual();
+        uint256 allShares = fresh.userShares(alice);
+
+        vm.prank(alice);
+        fresh.requestWithdraw(allShares, address(dai));
+
+        warp(1 days);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        assertEq(fresh.highWaterMarkPPS(), hwmBefore);
+        assertGt(fresh.lastFeeAccrual(), previousAccrual);
+    }
+
+    function testAllPendingDormantIntervalDoesNotDiluteNextDepositor() public {
+        Vault fresh = _deployDefaultVault(0, 500, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 1 ether);
+        uint256 aliceShares = fresh.userShares(alice);
+
+        vm.prank(alice);
+        fresh.requestWithdraw(aliceShares, address(dai));
+
+        assertEq(fresh.totalShares(), 0);
+        assertEq(fresh.totalAssets(), 1 ether);
+        assertEq(fresh.getPendingWithdraw(alice).wadOwed, 1 ether);
+
+        warp(10 * YEAR);
+
+        _depositDai(fresh, bob, 100 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        uint256 bobAssets = fresh.convertToAssets(fresh.userShares(bob));
+        uint256 feeRecipientAssets = fresh.convertToAssets(fresh.userShares(feeRecipient));
+
+        assertApproxEqAbs(bobAssets, 100 ether, 1);
+        assertLt(feeRecipientAssets, 1 ether);
+    }
+
     function testYieldLiftsHighWaterMarkAndChargesPerformanceFee() public {
         Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
 
