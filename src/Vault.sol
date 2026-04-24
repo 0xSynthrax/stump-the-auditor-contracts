@@ -61,6 +61,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     address[] public assetList;
     mapping(address => uint256) public userShares;
     mapping(address => address) public shareAssetOf;
+    mapping(address => uint256) public sharesByAsset;
     uint256 public totalShares;
     uint256 public totalManagedWad;
     mapping(address => WithdrawRequest) public pendingWithdraw;
@@ -115,12 +116,11 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint256 sharesMinted)
     {
-        _accrueFees();
-
         if (amount == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
 
         AssetConfig storage config = _requireWhitelistedAsset(asset);
+        _accrueFees(asset);
         _setOrCheckShareAsset(receiver, asset);
 
         bool initializingSupply = totalShares == 0;
@@ -144,6 +144,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         totalManagedWad += amountWad;
         totalShares += sharesMinted;
         userShares[receiver] += sharesMinted;
+        sharesByAsset[asset] += sharesMinted;
         config.totalHeld = balanceAfter;
 
         if (initializingSupply && highWaterMarkPPS == 0) {
@@ -166,10 +167,9 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint64 unlockBlock)
     {
-        _accrueFees();
-
         if (shares == 0) revert ZeroAmount();
         AssetConfig storage config = _requireWhitelistedAsset(asset);
+        _accrueFees(asset);
         _requireShareAsset(msg.sender, asset);
 
         WithdrawRequest storage existingRequest = pendingWithdraw[msg.sender];
@@ -190,6 +190,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
         userShares[msg.sender] = availableShares - shares;
         totalShares -= shares;
+        sharesByAsset[asset] -= shares;
         totalPendingWithdrawWad += wadOwed;
         reservedForWithdraw[asset] = alreadyReserved + reservedAmount;
 
@@ -210,11 +211,10 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Claims an unlocked withdrawal request in the asset chosen at request time.
     /// @return amountOut The token-native amount transferred to the caller.
     function claimWithdraw() external nonReentrant returns (uint256 amountOut) {
-        _accrueFees();
-
         WithdrawRequest memory request = pendingWithdraw[msg.sender];
         if (request.shares == 0) revert NoPendingWithdraw(msg.sender);
         if (block.number < request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
+        _accrueFees(address(0));
 
         AssetConfig storage config = assetConfig[request.asset];
         uint256 availableLiquidity = _syncTrackedHoldings(request.asset, config);
@@ -239,24 +239,30 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Cancels a pending withdrawal and restores the original burned shares.
     /// @dev Cancels are only allowed before the request becomes claimable to avoid post-unlock optionality.
-    ///      Restoring the original share count prevents request-wait-cancel management-fee dodging by making the
-    ///      canceller rejoin the diluted share supply instead of repricing back in at the lower post-fee PPS.
+    ///      The restored share count is repriced from the fixed pending WAD claim at the current active PPS.
     function cancelWithdraw() external nonReentrant {
-        _accrueFees();
-
         WithdrawRequest memory request = pendingWithdraw[msg.sender];
         if (request.shares == 0) revert NoPendingWithdraw(msg.sender);
         if (block.number >= request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
 
+        _accrueFees(address(0));
+
+        uint256 activeManagedWad = _activeManagedWad();
+        uint256 newShares = totalShares == 0 && activeManagedWad == 0
+            ? request.shares
+            : _computeShares(request.wadOwed, totalShares, activeManagedWad);
+        if (newShares == 0 && request.wadOwed != 0) revert ZeroAmount();
+
         totalPendingWithdrawWad -= request.wadOwed;
         reservedForWithdraw[request.asset] -= request.reservedAmount;
-        userShares[msg.sender] += request.shares;
-        totalShares += request.shares;
+        userShares[msg.sender] += newShares;
+        totalShares += newShares;
+        sharesByAsset[request.asset] += newShares;
 
         _removePendingUser(msg.sender);
         delete pendingWithdraw[msg.sender];
 
-        emit WithdrawCancelled(msg.sender, request.shares);
+        emit WithdrawCancelled(msg.sender, newShares);
     }
 
     /// @notice Returns the total managed assets tracked by the vault, in WAD.
@@ -324,7 +330,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Whitelists an asset for future deposits and withdrawals.
     /// @param asset The ERC20 asset to whitelist.
     function addAsset(address asset) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         if (asset == address(0)) revert ZeroAddress();
         if (assetConfig[asset].enabled) revert AssetAlreadyWhitelisted(asset);
@@ -345,9 +351,13 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Removes an asset from the whitelist after all tracked liquidity has been drained.
     /// @param asset The whitelisted asset to remove.
     function removeAsset(address asset) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         AssetConfig storage config = _requireWhitelistedAsset(asset);
+        uint256 outstandingShares = sharesByAsset[asset];
+        if (outstandingShares != 0 || reservedForWithdraw[asset] != 0) {
+            revert AssetHasOutstandingShares(asset, outstandingShares);
+        }
         uint256 held = _syncTrackedHoldings(asset, config);
         if (held != 0) revert AssetStillHeld(asset, held);
 
@@ -360,7 +370,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Sets the performance fee that applies to PPS gains above the high water mark.
     /// @param bps The new performance fee, in basis points.
     function setPerformanceFee(uint256 bps) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         if (bps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh(bps, MAX_PERFORMANCE_FEE_BPS);
         performanceFeeBps = bps;
@@ -371,7 +381,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Sets the annualized management fee.
     /// @param bps The new management fee, in basis points.
     function setManagementFee(uint256 bps) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         if (bps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh(bps, MAX_MANAGEMENT_FEE_BPS);
         managementFeeBps = bps;
@@ -382,7 +392,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Sets the withdrawal timelock.
     /// @param blocks_ The new timelock, in blocks.
     function setTimelockBlocks(uint256 blocks_) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         if (blocks_ > MAX_TIMELOCK_BLOCKS) revert TimelockTooLong(blocks_, MAX_TIMELOCK_BLOCKS);
         timelockBlocks = blocks_;
@@ -394,7 +404,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @dev Existing fee shares remain at the previous recipient address. Rotations only affect future accrual.
     /// @param recipient The new fee recipient.
     function setFeeRecipient(address recipient) external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
 
         if (recipient == address(0)) revert ZeroAddress();
         feeRecipient = recipient;
@@ -408,13 +418,16 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The whitelisted asset being realized as profit.
     /// @param amount The token-native profit amount to pull from the owner.
     function reportYield(address asset, uint256 amount) external onlyOwner {
-        _accrueFees();
+        _accrueFees(asset);
 
         if (amount == 0) revert ZeroAmount();
         uint256 activeManagedWad = _activeManagedWad();
         if (totalShares == 0 || activeManagedWad == 0) revert NoActiveShares();
 
         AssetConfig storage config = _requireWhitelistedAsset(asset);
+        if (performanceFeeBps != 0 || managementFeeBps != 0) {
+            _setOrCheckFeeRecipientAsset(asset);
+        }
         IERC20 assetToken = IERC20(asset);
         uint256 balanceBefore = assetToken.balanceOf(address(this));
         assetToken.safeTransferFrom(msg.sender, address(this), amount);
@@ -433,18 +446,18 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Accrues any pending management and performance fees.
     function accrueFees() external {
-        _accrueFees();
+        _accrueFees(address(0));
     }
 
     /// @notice Pauses new exposure-creating entry points.
     function pause() external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
         _pause();
     }
 
     /// @notice Unpauses new exposure-creating entry points.
     function unpause() external onlyOwner {
-        _accrueFees();
+        _accrueFees(address(0));
         _unpause();
     }
 
@@ -452,23 +465,27 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @dev PPS is measured against active managed assets only, excluding timelocked withdrawal liabilities, so deposits,
     ///      cancellations, and claim finalization preserve PPS up to round-down dust instead of appearing as new profit.
     ///      Pending withdrawals are fixed claims, leaving this path to price only active managed assets.
-    function _accrueFees() internal {
+    function _accrueFees(address feeAsset) internal {
         uint256 currentTime = block.timestamp;
         if (totalShares == 0) {
-            lastFeeAccrual = currentTime;
-            highWaterMarkPPS = 0;
+            if (totalPendingWithdrawWad == 0 && totalManagedWad == 0) {
+                lastFeeAccrual = currentTime;
+                highWaterMarkPPS = 0;
+            }
             return;
         }
 
         (,, uint256 mgmtFeeShares, uint256 perfFeeShares, uint256 newHighWaterMarkPPS) = _pendingFees();
+        uint256 feeShares = mgmtFeeShares + perfFeeShares;
 
-        if (mgmtFeeShares != 0) {
-            userShares[feeRecipient] += mgmtFeeShares;
-            totalShares += mgmtFeeShares;
-        }
-        if (perfFeeShares != 0) {
-            userShares[feeRecipient] += perfFeeShares;
-            totalShares += perfFeeShares;
+        if (feeShares != 0) {
+            address boundAsset = _resolveFeeRecipientAsset(feeAsset);
+            // Fee shares use the same single-asset binding as regular user shares; the recipient must claim before
+            // fees can accrue from a different asset.
+            _setOrCheckFeeRecipientAsset(boundAsset);
+            userShares[feeRecipient] += feeShares;
+            sharesByAsset[boundAsset] += feeShares;
+            totalShares += feeShares;
         }
         if (newHighWaterMarkPPS > highWaterMarkPPS) {
             highWaterMarkPPS = newHighWaterMarkPPS;
@@ -638,8 +655,34 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
     function _requireShareAsset(address user, address asset) internal view {
         address expectedAsset = shareAssetOf[user];
-        if (expectedAsset == address(0) || user == feeRecipient) return;
+        if (expectedAsset == address(0)) return;
         if (expectedAsset != asset) revert ShareAssetMismatch(user, expectedAsset, asset);
+    }
+
+    function _setOrCheckFeeRecipientAsset(address asset) internal {
+        address existingAsset = shareAssetOf[feeRecipient];
+        if (existingAsset == address(0)) {
+            shareAssetOf[feeRecipient] = asset;
+            return;
+        }
+        if (existingAsset != asset) revert FeeRecipientAssetMismatch(existingAsset, asset);
+    }
+
+    function _resolveFeeRecipientAsset(address preferredAsset) internal view returns (address asset) {
+        if (preferredAsset != address(0)) return preferredAsset;
+
+        address existingAsset = shareAssetOf[feeRecipient];
+        if (existingAsset != address(0)) return existingAsset;
+
+        for (uint256 i; i < assetList.length; ++i) {
+            address listedAsset = assetList[i];
+            if (sharesByAsset[listedAsset] == 0) continue;
+
+            if (asset != address(0)) revert FeeRecipientAssetMismatch(asset, listedAsset);
+            asset = listedAsset;
+        }
+
+        if (asset == address(0)) revert FeeRecipientAssetMismatch(address(0), address(0));
     }
 
     /// @notice Removes an asset from `assetList` in O(1) time via swap-and-pop.

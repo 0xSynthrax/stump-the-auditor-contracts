@@ -277,8 +277,9 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 debtValueWad;
         uint256 liquidatorBonus;
         (debtRepaid, debtValueWad) = _repayLiquidationDebt(borrower, debtAsset, debtToCover, debtReserve);
-        (collateralSeized, liquidatorBonus) =
-            _transferLiquidationCollateral(borrower, msg.sender, collateralAsset, collateralReserve, debtValueWad);
+        (collateralSeized, liquidatorBonus) = _transferLiquidationCollateral(
+            borrower, msg.sender, collateralAsset, collateralReserve, debtValueWad, debtRepaid
+        );
 
         emit Liquidated(borrower, msg.sender, collateralAsset, debtAsset, debtRepaid, collateralSeized, liquidatorBonus);
     }
@@ -662,10 +663,19 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         address liquidator,
         address collateralAsset,
         Reserve storage collateralReserve,
-        uint256 debtValueWad
+        uint256 debtValueWad,
+        uint256 debtToCover
     ) internal returns (uint256 collateralSeized, uint256 liquidatorBonus) {
+        uint256 baseCollateralAmount = _getAmountFromValueWad(collateralAsset, debtValueWad, Math.Rounding.Floor);
+        uint256 maxBonusCollateral =
+            Math.mulDiv(baseCollateralAmount, collateralReserve.liquidationBonusBps, BPS, Math.Rounding.Floor);
+        uint256 maxCollateralSeize = baseCollateralAmount + maxBonusCollateral;
+
         uint256 seizeValueWad = Math.mulDiv(debtValueWad, BPS + collateralReserve.liquidationBonusBps, BPS);
-        uint256 targetCollateralAmount = _getAmountFromValueWad(collateralAsset, seizeValueWad, Math.Rounding.Ceil);
+        uint256 targetCollateralAmount = _getAmountFromValueWad(collateralAsset, seizeValueWad, Math.Rounding.Floor);
+        if (targetCollateralAmount > maxCollateralSeize) {
+            targetCollateralAmount = maxCollateralSeize;
+        }
 
         uint256 borrowerScaledCollateral = userScaledSupply[borrower][collateralAsset];
         uint256 borrowerCollateral = LendingMath.scaledToUnderlying(
@@ -675,9 +685,9 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
             targetCollateralAmount = borrowerCollateral;
         }
 
-        // rounding: liquidation transfers scaled collateral UP so the seized underlying is not under-collected.
+        // rounding: liquidation floors both value and scaled-balance conversions so fragmentation cannot over-seize.
         uint256 scaledCollateralTransfer =
-            Math.mulDiv(targetCollateralAmount, RAY, collateralReserve.supplyIndex, Math.Rounding.Ceil);
+            Math.mulDiv(targetCollateralAmount, RAY, collateralReserve.supplyIndex, Math.Rounding.Floor);
         if (scaledCollateralTransfer > borrowerScaledCollateral) {
             scaledCollateralTransfer = borrowerScaledCollateral;
         }
@@ -685,6 +695,27 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         collateralSeized = LendingMath.scaledToUnderlying(
             scaledCollateralTransfer, collateralReserve.supplyIndex, Math.Rounding.Floor
         );
+        if (collateralSeized == 0) revert LiquidationSeizeTooSmall(debtToCover);
+
+        liquidatorBonus = collateralSeized > baseCollateralAmount ? collateralSeized - baseCollateralAmount : 0;
+        if (
+            liquidatorBonus != 0 && liquidatorBonus * BPS > baseCollateralAmount * collateralReserve.liquidationBonusBps
+        ) {
+            maxCollateralSeize = baseCollateralAmount + maxBonusCollateral;
+            if (maxCollateralSeize > borrowerCollateral) {
+                maxCollateralSeize = borrowerCollateral;
+            }
+            scaledCollateralTransfer =
+                Math.mulDiv(maxCollateralSeize, RAY, collateralReserve.supplyIndex, Math.Rounding.Floor);
+            if (scaledCollateralTransfer > borrowerScaledCollateral) {
+                scaledCollateralTransfer = borrowerScaledCollateral;
+            }
+            collateralSeized = LendingMath.scaledToUnderlying(
+                scaledCollateralTransfer, collateralReserve.supplyIndex, Math.Rounding.Floor
+            );
+            if (collateralSeized == 0) revert LiquidationSeizeTooSmall(debtToCover);
+            liquidatorBonus = collateralSeized > baseCollateralAmount ? collateralSeized - baseCollateralAmount : 0;
+        }
 
         userScaledSupply[borrower][collateralAsset] = borrowerScaledCollateral - scaledCollateralTransfer;
         userScaledSupply[liquidator][collateralAsset] += scaledCollateralTransfer;
@@ -696,9 +727,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
             _hasCollateral[liquidator][collateralAsset] = true;
             userCollateralAssets[liquidator].push(collateralAsset);
         }
-
-        uint256 baseCollateralAmount = _getAmountFromValueWad(collateralAsset, debtValueWad, Math.Rounding.Floor);
-        liquidatorBonus = collateralSeized > baseCollateralAmount ? collateralSeized - baseCollateralAmount : 0;
     }
 
     function _getAssetValueWad(address asset, uint256 amount) internal view returns (uint256 valueWad) {

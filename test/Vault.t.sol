@@ -253,6 +253,26 @@ contract VaultTest is BaseTest {
         assertEq(fresh.feeRecipient(), feeRecipient);
     }
 
+    function testFeeRecipientCannotWithdrawFeeSharesAgainstDifferentAsset() public {
+        Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 100 ether);
+        _depositUsdc(fresh, bob, 1_000e6);
+        _reportYield(fresh, dai, 20 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        uint256 feeShares = fresh.userShares(feeRecipient);
+        assertGt(feeShares, 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IVault.ShareAssetMismatch.selector, feeRecipient, address(dai), address(usdc))
+        );
+        vm.prank(feeRecipient);
+        fresh.requestWithdraw(feeShares, address(usdc));
+    }
+
     function test_reportYield_chargesPerfFeeOnlyOnActiveShares() public {
         Vault fresh = _deployDefaultVault(3_000, 0, DEFAULT_TIMELOCK);
 
@@ -384,6 +404,42 @@ contract VaultTest is BaseTest {
         fresh.claimWithdraw();
 
         assertEq(fresh.highWaterMarkPPS(), hwmBefore);
+    }
+
+    function testAllPendingAccrualPreservesHighWaterMarkAndFuturePerformanceFees() public {
+        Vault fresh = _deployDefaultVault(0, 0, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 100 ether);
+        _reportYield(fresh, dai, 20 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        uint256 hwmBefore = fresh.highWaterMarkPPS();
+        uint256 feeSharesBefore = fresh.userShares(feeRecipient);
+        uint256 allShares = fresh.userShares(alice);
+
+        vm.prank(alice);
+        fresh.requestWithdraw(allShares, address(dai));
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        assertEq(fresh.highWaterMarkPPS(), hwmBefore);
+        assertEq(fresh.userShares(feeRecipient), feeSharesBefore);
+
+        vm.prank(alice);
+        fresh.cancelWithdraw();
+
+        vm.prank(owner);
+        fresh.setPerformanceFee(2_000);
+
+        _reportYield(fresh, dai, 10 ether);
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        assertEq(fresh.highWaterMarkPPS(), _currentPps(fresh.totalAssets(), fresh.totalShares()));
+        assertGt(fresh.userShares(feeRecipient), feeSharesBefore);
     }
 
     function testYieldLiftsHighWaterMarkAndChargesPerformanceFee() public {
@@ -800,6 +856,37 @@ contract VaultTest is BaseTest {
         fresh.cancelWithdraw();
     }
 
+    function testCancelWithdrawRestoresAtCurrentPpsAfterYield() public {
+        Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
+
+        _depositDai(fresh, alice, 100 ether);
+        _depositDai(fresh, bob, 100 ether);
+
+        uint256 aliceOriginalShares = fresh.userShares(alice);
+        uint256 bobShares = fresh.userShares(bob);
+        vm.prank(alice);
+        fresh.requestWithdraw(aliceOriginalShares, address(dai));
+
+        _reportYield(fresh, dai, 100 ether);
+
+        vm.prank(alice);
+        fresh.cancelWithdraw();
+
+        uint256 restoredShares = fresh.userShares(alice);
+        assertLt(restoredShares, aliceOriginalShares);
+
+        uint256 aliceAssetsAfterCancel = fresh.convertToAssets(restoredShares);
+        uint256 bobAssetsAfterCancel = fresh.convertToAssets(bobShares);
+
+        vm.prank(alice);
+        fresh.requestWithdraw(restoredShares, address(dai));
+        uint256 wadOwedAfterCancel = fresh.getPendingWithdraw(alice).wadOwed;
+
+        assertApproxEqAbs(aliceAssetsAfterCancel, 100 ether, 1);
+        assertApproxEqAbs(wadOwedAfterCancel, aliceAssetsAfterCancel, 1);
+        assertGt(bobAssetsAfterCancel, 160 ether);
+    }
+
     function testFeeParamsUpdatedEventForPerformanceFee() public {
         Vault fresh = _deployDefaultVault(2_000, 100, DEFAULT_TIMELOCK);
 
@@ -926,7 +1013,7 @@ contract VaultTest is BaseTest {
         vault.cancelWithdraw();
     }
 
-    function test_cancelWithdraw_returnsOriginalShares() public {
+    function test_cancelWithdraw_repricesSharesAfterManagementFees() public {
         Vault fresh = _deployDefaultVault(0, 500, DEFAULT_TIMELOCK);
 
         _depositDai(fresh, alice, 100 ether);
@@ -939,17 +1026,16 @@ contract VaultTest is BaseTest {
         fresh.requestWithdraw(aliceSharesBefore, address(dai));
 
         vm.warp(block.timestamp + 365 days);
+        uint256 expectedRestoredShares = fresh.convertToShares(fresh.getPendingWithdraw(alice).wadOwed);
 
         vm.prank(alice);
         fresh.cancelWithdraw();
 
-        assertEq(fresh.userShares(alice), aliceSharesBefore);
+        assertEq(fresh.userShares(alice), expectedRestoredShares);
+        assertNotEq(fresh.userShares(alice), aliceSharesBefore);
         assertEq(fresh.userShares(bob), bobSharesBefore);
         assertGt(fresh.totalShares(), aliceSharesBefore + bobSharesBefore);
-        assertApproxEqAbs(
-            fresh.convertToAssets(fresh.userShares(alice)), fresh.convertToAssets(fresh.userShares(bob)), 1
-        );
-        assertLt(fresh.convertToAssets(fresh.userShares(alice)), 100 ether);
+        assertGt(fresh.userShares(feeRecipient), 0);
     }
 
     function testAddAssetAlreadyWhitelistedReverts() public {
@@ -968,9 +1054,21 @@ contract VaultTest is BaseTest {
     }
 
     function testRemoveAssetWithHoldingsReverts() public {
-        _depositUsdc(vault, alice, 100e6);
+        _mintAssetToVault(usdc, address(vault), 100e6);
 
         vm.expectRevert(abi.encodeWithSelector(IVault.AssetStillHeld.selector, address(usdc), 100e6));
+        vm.prank(owner);
+        vault.removeAsset(address(usdc));
+    }
+
+    function testRemoveAssetWithOutstandingSharesRevertsAfterHoldingsLeave() public {
+        bytes4 outstandingShares = bytes4(keccak256("AssetHasOutstandingShares(address,uint256)"));
+
+        _depositUsdc(vault, alice, 100e6);
+        vm.prank(owner);
+        usdc.burn(address(vault), 100e6);
+
+        vm.expectRevert(abi.encodeWithSelector(outstandingShares, address(usdc), vault.userShares(alice)));
         vm.prank(owner);
         vault.removeAsset(address(usdc));
     }

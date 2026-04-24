@@ -317,6 +317,68 @@ contract LendingTest is BaseTest {
         assertEq(bobCollateralAfter, 0);
     }
 
+    function testFragmentedLiquidationDoesNotCompoundCollateralRounding() public {
+        address dave = makeAddr("dave");
+        MockERC20 usd6 = deployMockToken("USD6", 6);
+
+        vm.startPrank(owner);
+        lending.setCloseFactor(10_000);
+        _listReserve(address(usd6), 8_000, 8_500, 1_000, 1_000, true, true);
+        oracle.setPrice(address(usd6), 1e8);
+        usd6.mint(bob, 3_000);
+        usd6.mint(dave, 3_000);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        usd6.approve(address(lending), type(uint256).max);
+        vm.prank(dave);
+        usd6.approve(address(lending), type(uint256).max);
+
+        _supply(alice, usdc, 10_000e6, alice);
+        vm.prank(bob);
+        lending.supply(address(usd6), 3_000, bob);
+        _borrow(bob, usdc, 2_000, bob);
+        vm.prank(dave);
+        lending.supply(address(usd6), 3_000, dave);
+        _borrow(dave, usdc, 2_000, dave);
+
+        vm.prank(owner);
+        oracle.setPrice(address(usd6), 0.5e8);
+
+        uint256 fragmentedSeized;
+        for (uint256 i; i < 1_000; ++i) {
+            vm.prank(charlie);
+            (, uint256 seized) = lending.liquidate(bob, address(usd6), address(usdc), 1);
+            fragmentedSeized += seized;
+        }
+
+        vm.prank(charlie);
+        (, uint256 singleSeized) = lending.liquidate(dave, address(usd6), address(usdc), 1_000);
+
+        assertLe(fragmentedSeized, singleSeized + 1);
+    }
+
+    function testLiquidationDustSeizeRevertsInsteadOfTakingOneCollateralUnit() public {
+        bytes4 seizeTooSmall = bytes4(keccak256("LiquidationSeizeTooSmall(uint256)"));
+
+        vm.prank(owner);
+        lending.setCloseFactor(10_000);
+
+        _supply(alice, weth, 1 ether, alice);
+        _supply(bob, usdc, 1, bob);
+
+        vm.prank(owner);
+        oracle.setPrice(address(weth), 9_000e8);
+        _borrow(bob, weth, 1, bob);
+
+        vm.prank(owner);
+        oracle.setPrice(address(usdc), 1);
+
+        vm.expectRevert(abi.encodeWithSelector(seizeTooSmall, 1));
+        vm.prank(charlie);
+        lending.liquidate(bob, address(usdc), address(weth), 1);
+    }
+
     function testInterestMathOverOneYearAtHalfUtilizationWithinTolerance() public {
         _supply(alice, usdc, 2_000e6, alice);
         _supply(bob, weth, 2 ether, bob);
