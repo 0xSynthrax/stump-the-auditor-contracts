@@ -253,7 +253,7 @@ contract VaultTest is BaseTest {
         assertEq(fresh.feeRecipient(), feeRecipient);
     }
 
-    function testFeeRecipientCannotWithdrawFeeSharesAgainstDifferentAsset() public {
+    function testFeeRecipientCanChooseDeferredFeeAssetButCannotSwitchAfterBinding() public {
         Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
 
         _depositDai(fresh, alice, 100 ether);
@@ -265,12 +265,119 @@ contract VaultTest is BaseTest {
 
         uint256 feeShares = fresh.userShares(feeRecipient);
         assertGt(feeShares, 0);
+        assertEq(fresh.shareAssetOf(feeRecipient), address(0));
 
-        vm.expectRevert(
-            abi.encodeWithSelector(IVault.ShareAssetMismatch.selector, feeRecipient, address(dai), address(usdc))
-        );
         vm.prank(feeRecipient);
         fresh.requestWithdraw(feeShares, address(usdc));
+
+        assertEq(fresh.shareAssetOf(feeRecipient), address(usdc));
+
+        vm.prank(feeRecipient);
+        fresh.cancelWithdraw();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IVault.ShareAssetMismatch.selector, feeRecipient, address(usdc), address(dai))
+        );
+        vm.prank(feeRecipient);
+        fresh.requestWithdraw(feeShares, address(dai));
+    }
+
+    function testMultiAssetPendingPerformanceFeesDoNotBlockPauseMatrixAndMaterializeOnFeeRecipientWithdraw() public {
+        Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
+
+        _depositUsdc(fresh, alice, 100e6);
+        _depositDai(fresh, bob, 100 ether);
+        _depositUsdc(fresh, charlie, 100e6);
+
+        uint256 aliceHalfShares = fresh.userShares(alice) / 2;
+        vm.prank(alice);
+        fresh.requestWithdraw(aliceHalfShares, address(usdc));
+
+        uint256 charlieHalfShares = fresh.userShares(charlie) / 2;
+        vm.prank(charlie);
+        fresh.requestWithdraw(charlieHalfShares, address(usdc));
+
+        _reportYield(fresh, usdc, 20e6);
+        assertEq(fresh.shareAssetOf(feeRecipient), address(0));
+
+        vm.prank(bob);
+        fresh.accrueFees();
+
+        uint256 feeShares = fresh.userShares(feeRecipient);
+        assertGt(feeShares, 0);
+        assertEq(fresh.shareAssetOf(feeRecipient), address(0));
+
+        vm.prank(owner);
+        fresh.pause();
+
+        vm.prank(charlie);
+        fresh.cancelWithdraw();
+
+        vm.prank(owner);
+        fresh.unpause();
+
+        advanceBlocks(DEFAULT_TIMELOCK);
+
+        vm.prank(owner);
+        fresh.pause();
+
+        vm.prank(alice);
+        fresh.claimWithdraw();
+
+        vm.prank(owner);
+        fresh.unpause();
+
+        uint256 feeSharesBeforeWithdraw = fresh.userShares(feeRecipient);
+        vm.prank(feeRecipient);
+        fresh.requestWithdraw(feeSharesBeforeWithdraw, address(usdc));
+
+        assertEq(fresh.shareAssetOf(feeRecipient), address(usdc));
+        assertEq(fresh.userShares(feeRecipient), 0);
+        assertEq(fresh.getPendingWithdraw(feeRecipient).shares, feeSharesBeforeWithdraw);
+    }
+
+    function testDeferredFeeSharesCannotBeDoubleMintedAcrossZeroAndConcreteAccruals() public {
+        Vault fresh = _deployDefaultVault(2_000, 0, DEFAULT_TIMELOCK);
+
+        _depositUsdc(fresh, alice, 100e6);
+        _depositDai(fresh, bob, 100 ether);
+        _reportYield(fresh, dai, 20 ether);
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        uint256 feeShares = fresh.userShares(feeRecipient);
+        uint256 totalSharesAfterZeroAccrual = fresh.totalShares();
+        assertGt(feeShares, 0);
+        assertEq(fresh.shareAssetOf(feeRecipient), address(0));
+
+        vm.prank(charlie);
+        fresh.accrueFees();
+
+        assertEq(fresh.userShares(feeRecipient), feeShares);
+        assertEq(fresh.totalShares(), totalSharesAfterZeroAccrual);
+
+        vm.prank(feeRecipient);
+        fresh.requestWithdraw(feeShares, address(dai));
+
+        assertEq(fresh.getPendingWithdraw(feeRecipient).shares, feeShares);
+        assertEq(fresh.userShares(feeRecipient), 0);
+        assertEq(fresh.totalShares(), totalSharesAfterZeroAccrual - feeShares);
+
+        vm.prank(feeRecipient);
+        fresh.cancelWithdraw();
+
+        uint256 restoredFeeShares = fresh.userShares(feeRecipient);
+        assertGt(restoredFeeShares, 0);
+        assertLe(restoredFeeShares, feeShares);
+        assertLe(fresh.totalShares(), totalSharesAfterZeroAccrual);
+
+        uint256 totalSharesBeforeDeposit = fresh.totalShares();
+        vm.prank(alice);
+        uint256 minted = fresh.deposit(address(usdc), 10e6, alice);
+
+        assertEq(fresh.userShares(feeRecipient), restoredFeeShares);
+        assertEq(fresh.totalShares(), totalSharesBeforeDeposit + minted);
     }
 
     function test_reportYield_chargesPerfFeeOnlyOnActiveShares() public {

@@ -279,6 +279,7 @@ contract StakingTest is BaseTest {
 
     function test_flushPenalty_doesNotExtendActiveStream() public {
         _stake(alice, DEFAULT_STAKE, tier30);
+        vm.roll(block.number + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
         _notify(address(stakingToken), 15 ether);
 
@@ -321,6 +322,7 @@ contract StakingTest is BaseTest {
 
     function testEmergencyUnstakeDistributesPenaltyImmediatelyWhenEligible() public {
         _stake(alice, DEFAULT_STAKE, tier30);
+        vm.roll(block.number + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
 
         vm.expectEmit(true, true, false, true);
@@ -348,9 +350,36 @@ contract StakingTest is BaseTest {
         assertEq(staking.earned(bob, address(stakingToken)), 0);
     }
 
-    function testEmergencyPenaltyCannotBeCapturedByLateStaker() public {
+    function testEmergencyPenaltyCannotBeCapturedByJustInTimeStaker() public {
         _stake(alice, DEFAULT_STAKE, tier30);
+        vm.roll(block.number + 1);
+        _stake(bob, uint128(staking.MIN_STAKE_AMOUNT()), tier30);
+
+        vm.prank(alice);
+        staking.emergencyUnstake(0);
+
+        (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
+        assertEq(queuedPenalty, 10 ether);
+        assertEq(staking.earned(bob, address(stakingToken)), 0);
+    }
+
+    function testEmergencyPenaltyStillRewardsOlderIncumbent() public {
         _stake(bob, DEFAULT_STAKE, tier30);
+        vm.roll(block.number + 1);
+        _stake(alice, DEFAULT_STAKE, tier30);
+
+        vm.prank(alice);
+        staking.emergencyUnstake(0);
+
+        (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
+        assertEq(queuedPenalty, 0);
+        assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 10 ether, DUST_TOLERANCE);
+    }
+
+    function testEmergencyPenaltyCannotBeCapturedByLateStaker() public {
+        _stake(bob, DEFAULT_STAKE, tier30);
+        vm.roll(block.number + 1);
+        _stake(alice, DEFAULT_STAKE, tier30);
 
         vm.prank(alice);
         staking.emergencyUnstake(0);

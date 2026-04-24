@@ -29,8 +29,9 @@ import {IStaking} from "./interfaces/IStaking.sol";
 ///     - `_userActiveStakeCount[user]` and `_userBoostedAmount[user]` are storage-tracked (O(1) reads), not derived by
 ///       scanning `_userStakes[user][]` on every call. Keeping them consistent is the caller's responsibility on every
 ///       mutation path.
-///     - Early-unstake penalties are credited immediately to the existing eligible boosted supply, excluding the
-///       penalized user's remaining stakes. If no eligible cohort exists, the penalty waits in `queuedPenalty`.
+///     - Early-unstake penalties are credited immediately only when the eligible cohort is known to predate the
+///       penalized stake, excluding the penalized user's remaining stakes. If no eligible cohort exists, or same/later
+///       stake activity makes the cohort unsafe to isolate, the penalty waits in `queuedPenalty`.
 ///       `flushPenalty()` moves queued penalty into the reward stream WITHOUT extending `periodFinish` — if a stream is
 ///       active, penalty is folded into the remaining window's rate. This prevents schedule-extension griefing.
 ///     - `compound()` zeros the user's primary-token reward balance BEFORE creating the new stake. No transfer — the tokens
@@ -67,6 +68,9 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => Stake[]) internal _userStakes;
     mapping(address => uint256) internal _userActiveStakeCount;
     mapping(address => uint256) internal _userBoostedAmount;
+    mapping(address => mapping(uint256 => uint64)) internal _stakeCreatedBlock;
+    mapping(uint64 => uint256) internal _activeBoostedAmountByCreatedBlock;
+    uint64 internal _latestStakeCreatedBlock;
 
     uint256 public totalRawSupply;
     uint256 public totalBoostedSupply;
@@ -152,12 +156,14 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
 
         uint128 amount = userStake.amount;
         uint128 boostedAmount = userStake.boostedAmount;
+        uint64 createdBlock = _stakeCreatedBlock[msg.sender][stakeId];
 
         userStake.withdrawn = true;
         totalRawSupply -= amount;
         totalBoostedSupply -= boostedAmount;
         _userActiveStakeCount[msg.sender] -= 1;
         _userBoostedAmount[msg.sender] -= boostedAmount;
+        _activeBoostedAmountByCreatedBlock[createdBlock] -= boostedAmount;
 
         stakingToken.safeTransfer(msg.sender, amount);
 
@@ -175,6 +181,7 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
 
         uint128 amount = userStake.amount;
         uint128 boostedAmount = userStake.boostedAmount;
+        uint64 createdBlock = _stakeCreatedBlock[msg.sender][stakeId];
         uint128 penalty = _toUint128(Math.mulDiv(amount, earlyUnstakePenaltyBps, BPS));
         uint128 returnAmount = amount - penalty;
 
@@ -183,8 +190,9 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         totalBoostedSupply -= boostedAmount;
         _userActiveStakeCount[msg.sender] -= 1;
         _userBoostedAmount[msg.sender] -= boostedAmount;
+        _activeBoostedAmountByCreatedBlock[createdBlock] -= boostedAmount;
 
-        _distributeOrQueuePenalty(msg.sender, penalty);
+        _distributeOrQueuePenalty(msg.sender, penalty, createdBlock);
 
         stakingToken.safeTransfer(msg.sender, returnAmount);
 
@@ -530,6 +538,7 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         boostedAmount = _toUint128(Math.mulDiv(amount, tier.multiplierBps, BPS));
         uint64 currentTime = _currentTime();
         unlockTime = _currentTimePlus(tier.duration);
+        uint64 createdBlock = _currentBlock();
 
         stakeId = _userStakes[user].length;
         _userStakes[user].push(
@@ -547,10 +556,22 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         totalBoostedSupply += boostedAmount;
         _userActiveStakeCount[user] += 1;
         _userBoostedAmount[user] += boostedAmount;
+        _stakeCreatedBlock[user][stakeId] = createdBlock;
+        _activeBoostedAmountByCreatedBlock[createdBlock] += boostedAmount;
+        if (createdBlock > _latestStakeCreatedBlock) _latestStakeCreatedBlock = createdBlock;
     }
 
-    function _distributeOrQueuePenalty(address penalizedUser, uint128 penalty) internal {
+    function _distributeOrQueuePenalty(address penalizedUser, uint128 penalty, uint64 penalizedCreatedBlock) internal {
         RewardData storage reward = rewardData[primaryRewardToken];
+        if (
+            _latestStakeCreatedBlock > penalizedCreatedBlock
+                || _activeBoostedAmountByCreatedBlock[penalizedCreatedBlock] != 0
+        ) {
+            reward.queuedPenalty += penalty;
+            emit PenaltyQueued(primaryRewardToken, penalty);
+            return;
+        }
+
         uint256 penalizedRemainingBoost = _userBoostedAmount[penalizedUser];
         uint256 eligibleBoostedSupply =
             totalBoostedSupply > penalizedRemainingBoost ? totalBoostedSupply - penalizedRemainingBoost : 0;
@@ -646,6 +667,11 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 unlockTime = block.timestamp + duration;
         if (unlockTime > type(uint64).max) revert Overflow();
         return uint64(unlockTime);
+    }
+
+    function _currentBlock() internal view returns (uint64) {
+        if (block.number > type(uint64).max) revert Overflow();
+        return uint64(block.number);
     }
 
     function _toUint128(uint256 value) internal pure returns (uint128 casted) {
