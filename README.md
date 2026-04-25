@@ -22,7 +22,7 @@ Every valid stump gets public recognition (opt-in). Interview fast-track means y
 
 ## How To Stump Us
 
-1. **Apply.** Submit the application form. Decisions roll out within 48 hours.
+1. **Apply.** Submit the application form. We're reviewing on a rolling basis throughout the challenge.
 2. **Get whitelisted on AI Auditor.** Approved applicants are whitelisted on https://aiauditor.certik.com. Sign up (Google or magic link) and your account is pre-loaded with **4 Lite scan credits**.
 3. **Pick a contract.** Fork this repo. Choose one of `Vault`, `Staking`, or `Lending`. Read the per-contract README to understand the mechanics.
 4. **Plant a vulnerability.** Modify your chosen contract, 50 lines or fewer. The bug must be:
