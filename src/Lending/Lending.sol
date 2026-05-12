@@ -57,10 +57,10 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public constant BPS = 10_000;
     uint256 public constant SECONDS_PER_YEAR = 365 days;
 
+    uint16 public constant LIQUIDATION_THRESHOLD_BPS = 9_000;
+    uint16 public constant LIQUIDATION_BONUS_BPS = 2_000;
     uint256 public constant MIN_HEALTH_FACTOR = 1e18;
     uint256 public constant MAX_CLOSE_FACTOR_BPS = 10_000;
-    uint256 public constant MAX_LIQ_BONUS_BPS = 2_000;
-    uint256 public constant MAX_COLLATERAL_FACTOR_BPS = 9_000;
     uint256 public constant MAX_RESERVE_FACTOR_BPS = 5_000;
     uint256 public constant MAX_ORACLE_STALENESS = 1 hours;
     uint8 public constant ORACLE_DECIMALS = 8;
@@ -384,8 +384,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The reserve asset to list.
     /// @param irParams The reserve's interest-rate parameters.
     /// @param collateralFactorBps_ The collateral factor in basis points.
-    /// @param liquidationThresholdBps The liquidation threshold in basis points.
-    /// @param liquidationBonusBps The liquidation bonus in basis points.
     /// @param reserveFactorBps The reserve factor in basis points.
     /// @param borrowEnabled Whether borrowing this asset is enabled.
     /// @param useAsCollateral Whether supplied balances of this asset count as collateral.
@@ -393,8 +391,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         address asset,
         InterestRateParams calldata irParams,
         uint16 collateralFactorBps_,
-        uint16 liquidationThresholdBps,
-        uint16 liquidationBonusBps,
         uint16 reserveFactorBps,
         bool borrowEnabled,
         bool useAsCollateral
@@ -402,7 +398,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         if (asset == address(0)) revert ZeroAddress();
         if (reserves[asset].listed) revert ReserveAlreadyListed(asset);
 
-        _validateReserveParams(collateralFactorBps_, liquidationThresholdBps, liquidationBonusBps, reserveFactorBps);
+        _validateReserveParams(collateralFactorBps_, reserveFactorBps);
 
         uint8 decimals_ = IERC20Metadata(asset).decimals();
         if (decimals_ < MIN_RESERVE_DECIMALS || decimals_ > MAX_RESERVE_DECIMALS) revert UnsupportedToken(asset);
@@ -412,8 +408,8 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
             useAsCollateral: useAsCollateral,
             decimals: decimals_,
             collateralFactorBps: collateralFactorBps_,
-            liquidationThresholdBps: liquidationThresholdBps,
-            liquidationBonusBps: liquidationBonusBps,
+            liquidationThresholdBps: LIQUIDATION_THRESHOLD_BPS,
+            liquidationBonusBps: LIQUIDATION_BONUS_BPS,
             reserveFactorBps: reserveFactorBps,
             totalScaledSupply: 0,
             totalScaledBorrow: 0,
@@ -426,35 +422,29 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         reserveList.push(asset);
 
         emit ReserveListed(
-            asset, decimals_, collateralFactorBps_, liquidationThresholdBps, liquidationBonusBps, reserveFactorBps
+            asset, decimals_, collateralFactorBps_, LIQUIDATION_THRESHOLD_BPS, LIQUIDATION_BONUS_BPS, reserveFactorBps
         );
     }
 
     /// @notice Updates reserve collateral and reserve-factor parameters.
     /// @param asset The reserve asset to update.
     /// @param collateralFactorBps_ The new collateral factor in basis points.
-    /// @param liquidationThresholdBps The new liquidation threshold in basis points.
-    /// @param liquidationBonusBps The new liquidation bonus in basis points.
     /// @param reserveFactorBps The new reserve factor in basis points.
     function setReserveParams(
         address asset,
         uint16 collateralFactorBps_,
-        uint16 liquidationThresholdBps,
-        uint16 liquidationBonusBps,
         uint16 reserveFactorBps
     ) external onlyOwner {
         _accrueInterest(asset);
 
         Reserve storage reserve = _getReserveStorage(asset);
-        _validateReserveParams(collateralFactorBps_, liquidationThresholdBps, liquidationBonusBps, reserveFactorBps);
+        _validateReserveParams(collateralFactorBps_, reserveFactorBps);
 
         reserve.collateralFactorBps = collateralFactorBps_;
-        reserve.liquidationThresholdBps = liquidationThresholdBps;
-        reserve.liquidationBonusBps = liquidationBonusBps;
         reserve.reserveFactorBps = reserveFactorBps;
 
         emit ReserveParamsUpdated(
-            asset, collateralFactorBps_, liquidationThresholdBps, liquidationBonusBps, reserveFactorBps
+            asset, collateralFactorBps_, LIQUIDATION_THRESHOLD_BPS, LIQUIDATION_BONUS_BPS, reserveFactorBps
         );
     }
 
@@ -834,22 +824,13 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
     function _validateReserveParams(
         uint16 collateralFactorBps_,
-        uint16 liquidationThresholdBps,
-        uint16 liquidationBonusBps,
         uint16 reserveFactorBps
     ) internal pure {
-        if (collateralFactorBps_ > MAX_COLLATERAL_FACTOR_BPS) {
-            revert CollateralFactorTooHigh(collateralFactorBps_, MAX_COLLATERAL_FACTOR_BPS);
+
+        if (LIQUIDATION_THRESHOLD_BPS < collateralFactorBps_) {
+            revert LiquidationThresholdInvalid(collateralFactorBps_, LIQUIDATION_THRESHOLD_BPS);
         }
-        if (liquidationThresholdBps > MAX_COLLATERAL_FACTOR_BPS || liquidationThresholdBps < collateralFactorBps_) {
-            revert LiquidationThresholdInvalid(collateralFactorBps_, liquidationThresholdBps);
-        }
-        if (liquidationBonusBps > MAX_LIQ_BONUS_BPS) {
-            revert LiquidationBonusTooHigh(liquidationBonusBps, MAX_LIQ_BONUS_BPS);
-        }
-        if (uint256(liquidationThresholdBps) * (BPS + liquidationBonusBps) >= BPS * BPS) {
-            revert LiquidationBonusTooHigh(liquidationBonusBps, MAX_LIQ_BONUS_BPS);
-        }
+
         if (reserveFactorBps > MAX_RESERVE_FACTOR_BPS) {
             revert ReserveFactorTooHigh(reserveFactorBps, MAX_RESERVE_FACTOR_BPS);
         }

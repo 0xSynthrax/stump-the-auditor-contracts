@@ -246,9 +246,9 @@ contract LendingInvariants is BaseTest {
         vm.startPrank(owner);
         oracle = new PriceOracle();
         lending = new Lending(IPriceOracle(address(oracle)), 5_000);
-        lending.listReserve(address(usdc), _defaultIrParams(), 8_000, 8_500, 500, 1_000, true, true);
-        lending.listReserve(address(weth), _defaultIrParams(), 7_500, 8_000, 500, 1_000, true, true);
-        lending.listReserve(address(wbtc), _defaultIrParams(), 7_000, 7_500, 500, 1_000, true, true);
+        lending.listReserve(address(usdc), _defaultIrParams(), 8_000, 1_000, true, true);
+        lending.listReserve(address(weth), _defaultIrParams(), 7_500, 1_000, true, true);
+        lending.listReserve(address(wbtc), _defaultIrParams(), 7_000, 1_000, true, true);
         oracle.setPrice(address(usdc), 1e8);
         oracle.setPrice(address(weth), 2_000e8);
         oracle.setPrice(address(wbtc), 30_000e8);

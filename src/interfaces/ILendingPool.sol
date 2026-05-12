@@ -200,8 +200,6 @@ interface ILendingPool {
     /// @param asset The reserve asset to list.
     /// @param irParams The reserve's interest-rate parameters.
     /// @param collateralFactorBps The collateral factor in basis points.
-    /// @param liquidationThresholdBps The liquidation threshold in basis points.
-    /// @param liquidationBonusBps The liquidation bonus in basis points.
     /// @param reserveFactorBps The reserve factor in basis points.
     /// @param borrowEnabled Whether borrowing this asset is enabled.
     /// @param useAsCollateral Whether supplied balances of this asset count as collateral.
@@ -209,8 +207,6 @@ interface ILendingPool {
         address asset,
         InterestRateParams calldata irParams,
         uint16 collateralFactorBps,
-        uint16 liquidationThresholdBps,
-        uint16 liquidationBonusBps,
         uint16 reserveFactorBps,
         bool borrowEnabled,
         bool useAsCollateral
@@ -219,14 +215,10 @@ interface ILendingPool {
     /// @notice Updates reserve collateral and reserve-factor parameters.
     /// @param asset The reserve asset to update.
     /// @param collateralFactorBps The new collateral factor in basis points.
-    /// @param liquidationThresholdBps The new liquidation threshold in basis points.
-    /// @param liquidationBonusBps The new liquidation bonus in basis points.
     /// @param reserveFactorBps The new reserve factor in basis points.
     function setReserveParams(
         address asset,
         uint16 collateralFactorBps,
-        uint16 liquidationThresholdBps,
-        uint16 liquidationBonusBps,
         uint16 reserveFactorBps
     ) external;
 
